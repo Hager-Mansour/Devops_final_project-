@@ -1,0 +1,296 @@
+---
+# Azure DevOps Pipeline - Infrastructure Destroy
+# DANGEROUS: Destroys all infrastructure resources
+# Use with extreme caution - MANUAL TRIGGER ONLY
+
+trigger: none # Never auto-trigger
+pr: none # Never run on PR
+
+parameters:
+  - name: environment
+    displayName: "Environment to Destroy"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: confirmDestroy
+    displayName: "Type DESTROY to confirm"
+    type: string
+    default: ""
+
+variables:
+  - group: infrastructure-${{ parameters.environment }}
+  - name: terraformVersion
+    value: "1.6.0"
+  - name: awsRegion
+    value: "us-east-1"
+
+pool:
+  name: "MyLocalPool" # Use 'Default' for self-hosted agents"
+
+stages:
+  # ============================================
+  # Stage 1: Validation
+  # ============================================
+  - stage: ValidateDestroy
+    displayName: "Validate Destroy Request"
+    jobs:
+      - job: CheckConfirmation
+        displayName: "Verify Confirmation"
+        steps:
+          - script: |
+              if [ "${{ parameters.confirmDestroy }}" != "DESTROY" ]; then
+                echo "ERROR: Confirmation text does not match"
+                echo "Expected: DESTROY"
+                echo "Received: ${{ parameters.confirmDestroy }}"
+                exit 1
+              fi
+
+              echo "Confirmation verified: ${{ parameters.confirmDestroy }}"
+              echo "Environment: ${{ parameters.environment }}"
+              echo ""
+              echo "WARNING: This will destroy ALL infrastructure in ${{ parameters.environment }}"
+            displayName: "Verify Destroy Confirmation"
+
+  # ============================================
+  # Stage 2: First Approval Gate
+  # ============================================
+  - stage: FirstApproval
+    displayName: "First Approval Gate"
+    dependsOn: ValidateDestroy
+    jobs:
+      - job: WaitForFirstApproval
+        displayName: "Wait for First Approval"
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: ""
+              instructions: |
+                WARNING: You are about to DESTROY the ${{ parameters.environment }} environment.
+
+                This will DELETE:
+                - EKS Cluster
+                - VPC and all networking
+                - IAM roles and policies
+                - ECR repositories
+                - All associated resources
+
+                This action CANNOT be undone!
+
+                Please review carefully before approving.
+              onTimeout: "reject"
+
+  # ============================================
+  # Stage 3: Backup Verification
+  # ============================================
+  - stage: BackupCheck
+    displayName: "Verify Backups"
+    dependsOn: FirstApproval
+    jobs:
+      - job: CheckBackups
+        displayName: "Verify State Backups"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - script: |
+              # Check S3 state file versions
+              ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+              BUCKET="devsecops-tfstate-${ACCOUNT_ID}-${{ parameters.environment }}"
+              KEY="eks-infrastructure/terraform.tfstate"
+
+              echo "Checking state file backups..."
+              aws s3api list-object-versions \
+                --bucket "$BUCKET" \
+                --prefix "$KEY" \
+                --query 'Versions[*].[Key,VersionId,LastModified]' \
+                --output table
+
+              echo ""
+              echo "Terraform state backups verified!"
+            displayName: "Verify State File Backups"
+
+  # ============================================
+  # Stage 4: Second Approval Gate
+  # ============================================
+  - stage: SecondApproval
+    displayName: "Final Approval Gate"
+    dependsOn: BackupCheck
+    jobs:
+      - job: WaitForFinalApproval
+        displayName: "Wait for Final Approval"
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: ""
+              instructions: |
+                FINAL WARNING: This is your last chance to cancel!
+
+                Environment: ${{ parameters.environment }}
+                Action: DESTROY ALL RESOURCES
+
+                State backups have been verified.
+
+                Type your approval to proceed with destruction.
+              onTimeout: "reject"
+
+  # ============================================
+  # Stage 5: Kubernetes Cleanup
+  # ============================================
+  - stage: KubernetesCleanup
+    displayName: "Clean Up Kubernetes Resources"
+    dependsOn: SecondApproval
+    jobs:
+      - job: CleanupLoadBalancers
+        displayName: "Delete LoadBalancer Services"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - script: |
+              # Get cluster name
+              ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+              CLUSTER_NAME="devsecops-${{ parameters.environment }}-eks"
+
+              # Configure kubectl
+              echo "Configuring kubectl for cluster: $CLUSTER_NAME"
+              aws eks update-kubeconfig \
+                --name $CLUSTER_NAME \
+                --region $(awsRegion) 2>/dev/null || {
+                echo "⚠️ Cluster not found or already destroyed. Skipping cleanup."
+                exit 0
+              }
+
+              # Check if cluster is accessible
+              kubectl cluster-info &>/dev/null || {
+                echo "⚠️ Cluster not accessible. Skipping cleanup."
+                exit 0
+              }
+
+              echo "========================================="
+              echo "Finding LoadBalancer Services"
+              echo "========================================="
+
+              # List all LoadBalancer services
+              LB_SERVICES=$(kubectl get svc --all-namespaces -o json | \
+                jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace)/\(.metadata.name)"')
+
+              if [ -z "$LB_SERVICES" ]; then
+                echo "✓ No LoadBalancer services found"
+              else
+                echo "Found LoadBalancer services:"
+                echo "$LB_SERVICES"
+                echo ""
+                echo "Deleting LoadBalancer services..."
+                
+                # Delete each LoadBalancer service
+                echo "$LB_SERVICES" | while read svc; do
+                  if [ -n "$svc" ]; then
+                    NAMESPACE=$(echo $svc | cut -d'/' -f1)
+                    NAME=$(echo $svc | cut -d'/' -f2)
+                    echo "  Deleting $NAME in namespace $NAMESPACE..."
+                    kubectl delete svc $NAME -n $NAMESPACE --timeout=60s || true
+                  fi
+                done
+                
+                echo ""
+                echo "Waiting 60 seconds for AWS resources to be released..."
+                sleep 60
+              fi
+
+              echo ""
+              echo "========================================="
+              echo "Checking for Orphaned Load Balancers"
+              echo "========================================="
+
+              # Check for any remaining load balancers with kubernetes.io tag
+              echo "Classic Load Balancers:"
+              aws elb describe-load-balancers --region $(awsRegion) \
+                --query 'LoadBalancerDescriptions[*].[LoadBalancerName,DNSName]' \
+                --output table 2>/dev/null | grep -i kubernetes || echo "  None found"
+
+              echo ""
+              echo "Application/Network Load Balancers:"
+              aws elbv2 describe-load-balancers --region $(awsRegion) \
+                --query 'LoadBalancers[*].[LoadBalancerName,Type]' \
+                --output table 2>/dev/null || echo "  None found"
+
+              echo ""
+              echo "✓ Kubernetes cleanup complete"
+            displayName: "Clean Up LoadBalancer Services"
+            continueOnError: true
+
+  # ============================================
+  # Stage 6: Terraform Destroy
+  # ============================================
+  - stage: TerraformDestroy
+    displayName: "Destroy Infrastructure"
+    dependsOn: KubernetesCleanup
+    jobs:
+      - job: Destroy
+        displayName: "Run Terraform Destroy"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - script: |
+              # Get AWS account ID
+              ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+              terraform init \
+                -backend-config="bucket=devsecops-tfstate-${ACCOUNT_ID}-${{ parameters.environment }}" \
+                -backend-config="region=$(awsRegion)"
+            displayName: "Terraform Init"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              terraform destroy \
+                -var="environment=${{ parameters.environment }}" \
+                -var="aws_region=$(awsRegion)" \
+                -auto-approve
+            displayName: "Terraform Destroy"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+            env:
+              TF_VAR_environment: ${{ parameters.environment }}
+              TF_VAR_aws_region: $(awsRegion)
+
+          - script: |
+              echo "========================================="
+              echo "INFRASTRUCTURE DESTROYED"
+              echo "========================================="
+              echo "Environment: ${{ parameters.environment }}"
+              echo "Timestamp: $(Build.BuildNumber)"
+              echo ""
+              echo "All resources have been destroyed."
+              echo "State file backups remain in S3."
+            displayName: "Destruction Summary"

@@ -1,0 +1,178 @@
+# ============================================
+# Azure DevOps Pipeline: PR Validation
+# ============================================
+# Purpose: Validate Helm charts and configurations on Pull Requests
+# Triggers: Pull Requests to main branch
+# Does NOT build images or push to registry
+# ============================================
+
+trigger: none # Disable CI trigger
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - "helm/**"
+      - "frontend/**"
+      - "backend/**"
+      - ".azure-pipelines/**"
+
+pool:
+  name: MyLocalPool
+
+variables:
+  HELM_VERSION: "3.14.0"
+  TRIVY_VERSION: "0.48.3"
+
+stages:
+  - stage: ValidateHelm
+    displayName: "Validate Helm Charts"
+    jobs:
+      - job: HelmLint
+        displayName: "Helm Lint & Template Validation"
+        steps:
+          - task: Bash@3
+            displayName: "Verify Helm"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Verifying Helm is installed..."
+                helm version --short
+                echo "✓ Helm ready"
+
+          - task: Bash@3
+            displayName: "Helm Lint"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Running Helm lint on chart..."
+                helm lint helm/app/ --strict
+              failOnStderr: false
+
+          - task: Bash@3
+            displayName: "Helm Template Dry-Run"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Rendering Helm templates..."
+                helm template microservices-app helm/app/ \
+                  --namespace dev \
+                  --values helm/app/values.yaml \
+                  --dry-run \
+                  --debug > /tmp/rendered-manifests.yaml
+
+                echo "✓ Helm templates rendered successfully"
+                echo "Generated $(wc -l < /tmp/rendered-manifests.yaml) lines of manifests"
+
+          - task: Bash@3
+            displayName: "Validate Kubernetes YAML"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Validating Kubernetes YAML syntax..."
+
+                # Validate rendered templates
+                helm template microservices-app helm/app/ --values helm/app/values.yaml | kubeval --strict
+
+                echo "✓ All manifests are valid Kubernetes YAML"
+
+  - stage: SecurityScan
+    displayName: "Security Scanning"
+    dependsOn: ValidateHelm
+    jobs:
+      - job: TrivyFilesystemScan
+        displayName: "Trivy Filesystem Scan"
+        steps:
+          - task: Bash@3
+            displayName: "Verify Trivy"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Verifying Trivy is installed..."
+                trivy --version
+                echo "✓ Trivy ready"
+
+          - task: Bash@3
+            displayName: "Scan Helm Chart for Misconfigurations"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Scanning Helm chart for security misconfigurations..."
+
+                trivy config helm/app/ \
+                  --severity HIGH,CRITICAL \
+                  --exit-code 0 \
+                  --format table
+
+                # Generate HTML report
+                trivy config helm/app/ \
+                  --severity HIGH,CRITICAL \
+                  --format template \
+                  --template '@/usr/local/share/trivy/templates/html.tpl' \
+                  --output $(Build.ArtifactStagingDirectory)/html-reports/trivy-helm-report.html
+
+                echo "✓ Helm chart scan completed"
+
+          - task: Bash@3
+            displayName: "Scan Dockerfiles"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Scanning Dockerfiles for best practice violations..."
+
+                # Scan frontend Dockerfile
+                if [ -f frontend/Dockerfile ]; then
+                  trivy config frontend/Dockerfile \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0
+                fi
+
+                # Scan backend Dockerfile
+                if [ -f backend/Dockerfile ]; then
+                  trivy config backend/Dockerfile \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0
+                fi
+
+                echo "✓ Dockerfile scans completed"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Security Reports"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/html-reports"
+              ArtifactName: "security-reports"
+              publishLocation: "Container"
+
+          - task: PublishHtmlReport@1
+            displayName: "Publish HTML Security Report"
+            condition: succeededOrFailed()
+            inputs:
+              reportDir: "$(Build.ArtifactStagingDirectory)/html-reports"
+              tabName: "Security Scan Results"
+
+  - stage: ReportResults
+    displayName: "Report Validation Results"
+    dependsOn:
+      - ValidateHelm
+      - SecurityScan
+    jobs:
+      - job: Summary
+        displayName: "Validation Summary"
+        steps:
+          - task: Bash@3
+            displayName: "Print Summary"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "======================================"
+                echo "PR Validation Summary"
+                echo "======================================"
+                echo "✓ Helm lint passed"
+                echo "✓ Template rendering successful"
+                echo "✓ YAML validation passed"
+                echo "✓ Security scans completed"
+                echo ""
+                echo "This PR is ready for review!"
+                echo "======================================"

@@ -1,0 +1,235 @@
+# ============================================
+# Global Configuration
+# ============================================
+global:
+  environment: dev
+  domain: example.com
+
+# ============================================
+# Frontend Configuration
+# ============================================
+frontend:
+  enabled: true
+
+  image:
+    repository: 860973283177.dkr.ecr.us-east-1.amazonaws.com/devsecops-dev-devsecops-dev-frontend
+    tag: 190  # Updated by CI/CD pipeline with Git SHA
+    pullPolicy: Always
+
+  replicaCount: 2
+
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 80
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Environment variables for frontend
+  env:
+    REACT_APP_API_URL: "/api"
+
+  # Readiness and liveness probes
+  livenessProbe:
+    httpGet:
+      path: /
+      port: 80
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /
+      port: 80
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ============================================
+# Backend Configuration
+# ============================================
+backend:
+  enabled: true
+
+  image:
+    repository: 860973283177.dkr.ecr.us-east-1.amazonaws.com/devsecops-dev-devsecops-dev-backend
+    tag: 190  # Updated by CI/CD pipeline with Git SHA
+    pullPolicy: Always
+
+  replicaCount: 2
+
+  # ServiceAccount for IRSA (IAM Roles for Service Accounts)
+  serviceAccount:
+    create: true
+    name: backend-sa
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::860973283177:role/devsecops-dev-eks-backend-ssm-role"
+
+  service:
+    type: ClusterIP
+    port: 5000
+    targetPort: 5000
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
+  # Environment variables for backend
+  env:
+    FLASK_ENV: production
+    FLASK_APP: app.py
+    # Database connection - RDS PostgreSQL (password URL-encoded)
+    DATABASE_URL: "postgresql://appuser:%5Df_%283QblL_CquGN%5D@devsecops-dev-postgres.cevwmyuam39s.us-east-1.rds.amazonaws.com:5432/appdb?sslmode=require"
+    # SSM Parameter path (for apps with AWS SDK support)
+    DATABASE_SSM_PARAMETER: /devsecops/dev/rds/connection-string
+    AWS_REGION: us-east-1
+
+  # Readiness and liveness probes
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 5000
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 5000
+    initialDelaySeconds: 15
+    periodSeconds: 5
+  # timeoutSeconds: 3
+  # failureThreshold: 3
+
+# ============================================
+# PostgreSQL StatefulSet Configuration
+# ============================================
+postgresql:
+  enabled: false # Using RDS instead of in-cluster Postgres
+
+  image:
+    repository: postgres
+    tag: "15-alpine"
+    pullPolicy: IfNotPresent
+
+  # StatefulSet configuration
+  replicaCount: 1 # Single instance for dev; use replication for prod
+
+  service:
+    type: ClusterIP
+    port: 5432
+    targetPort: 5432
+
+  # Database configuration
+  database: microservices_db
+  username: postgres
+  # Password stored in Kubernetes Secret (not here!)
+
+  # Persistence configuration
+  persistence:
+    enabled: true
+    storageClass: "gp2" # AWS EBS GP2
+    accessMode: ReadWriteOnce
+    size: 10Gi
+    mountPath: /var/lib/postgresql/data
+    subPath: postgres # Important: prevents permission issues
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Health checks
+  livenessProbe:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - pg_isready -U postgres
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  readinessProbe:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - pg_isready -U postgres
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ============================================
+# Ingress Configuration
+# ============================================
+ingress:
+  enabled: true
+  className: nginx # NGINX Ingress Controller
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+  hosts:
+    - host: "" # Empty host allows access via NLB DNS
+      paths:
+        - path: /
+          pathType: Prefix
+          backend: frontend
+        - path: /api
+          pathType: Prefix
+          backend: backend
+
+# ============================================
+# Security Configuration
+# ============================================
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# ============================================
+# Pod Disruption Budget
+# ============================================
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

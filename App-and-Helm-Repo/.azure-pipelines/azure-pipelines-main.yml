@@ -1,0 +1,579 @@
+# ============================================
+# Azure DevOps Pipeline: Main Release (CI/CD with DevSecOps)
+# ============================================
+# Purpose: Build, scan, sign, and deploy application
+# Triggers: Push to main branch
+# Implements full DevSecOps workflow
+# ============================================
+
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    exclude:
+      - "README.md"
+      - "docs/**"
+      - "helm/app/values.yaml" # Exclude to prevent loop
+
+pr: none
+
+pool:
+  name: MyLocalPool
+
+variables:
+  # Variable Groups (from Azure DevOps Library)
+  - group: AWS-Credentials # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+  - group: Docker-Registry # ECR_REGISTRY, FRONTEND_REPO, BACKEND_REPO
+  - group: Cosign-Keys # COSIGN_PRIVATE_KEY, COSIGN_PUBLIC_KEY, COSIGN_PASSWORD
+  - group: Git-Credentials # GIT_PAT, GIT_EMAIL, GIT_USERNAME
+
+  # Pipeline-specific variables (not in variable groups)
+  - name: IMAGE_TAG
+    value: $(Build.BuildId)
+  - name: BUILD_ID
+    value: $(Build.BuildId)
+
+  # Tool versions
+  - name: TRIVY_VERSION
+    value: "0.48.3"
+  - name: COSIGN_VERSION
+    value: "2.2.2"
+  - name: SYFT_VERSION
+    value: "0.99.0"
+  - name: HELM_VERSION
+    value: "3.14.0"
+
+stages:
+  # ============================================
+  # Stage 1: Prerequisites & Validation
+  # ============================================
+  - stage: Prerequisites
+    displayName: "Prerequisites Check"
+    jobs:
+      - job: ValidateTools
+        displayName: "Validate Tools & AWS Access"
+        steps:
+          - task: Bash@3
+            displayName: "Verify Required Tools"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Verifying DevSecOps toolchain on self-hosted agent..."
+
+                # Verify AWS CLI
+                echo "AWS CLI: $(aws --version)"
+
+                # Verify Trivy
+                echo "Trivy: $(trivy --version | head -n1)"
+
+                # Verify Cosign
+                echo "Cosign: $(cosign version 2>&1 | head -n1)"
+
+                # Verify Syft
+                echo "Syft: $(syft version | head -n1)"
+
+                # Verify Helm
+                echo "Helm: $(helm version --short)"
+
+                # Verify Docker
+                echo "Docker: $(docker --version)"
+
+                # Verify kubectl
+                echo "kubectl: $(kubectl version --client --short 2>/dev/null || echo 'kubectl version not available')"
+
+                echo ""
+                echo "✓ All tools verified and ready!"
+
+          - task: Bash@3
+            displayName: "Configure AWS Credentials"
+            inputs:
+              targetType: "inline"
+              script: |
+                # Configure AWS credentials from variable group
+                aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+                aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+                aws configure set region $(AWS_REGION)
+
+                # Verify AWS access
+                echo "Verifying AWS credentials..."
+                aws sts get-caller-identity
+
+                echo "✓ AWS credentials configured successfully"
+
+          - task: Bash@3
+            displayName: "Verify ECR Access"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Verifying ECR repository access..."
+
+                # Login to ECR
+                aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY)
+
+                # Verify repositories exist
+                aws ecr describe-repositories --repository-names $(FRONTEND_REPO) --region $(AWS_REGION)
+                aws ecr describe-repositories --repository-names $(BACKEND_REPO) --region $(AWS_REGION)
+
+                echo "✓ ECR access verified"
+
+  # ============================================
+  # Stage 2: Build Docker Images
+  # ============================================
+  - stage: Build
+    displayName: "Build Docker Images"
+    dependsOn: Prerequisites
+    jobs:
+      - job: BuildImages
+        displayName: "Build Frontend & Backend"
+        steps:
+          - task: Docker@2
+            displayName: "Build Frontend Image"
+            inputs:
+              command: "build"
+              dockerfile: "frontend/Dockerfile"
+              repository: "$(ECR_REGISTRY)/$(FRONTEND_REPO)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+              buildContext: "frontend"
+              arguments: "--build-arg REACT_APP_API_URL=/api"
+            env:
+              DOCKER_BUILDKIT: 1
+
+          - task: Docker@2
+            displayName: "Build Backend Image"
+            inputs:
+              command: "build"
+              dockerfile: "backend/Dockerfile"
+              repository: "$(ECR_REGISTRY)/$(BACKEND_REPO)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          - task: Bash@3
+            displayName: "Verify Images Built"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Images built:"
+                docker images | grep $(ECR_REGISTRY)
+
+                echo "✓ Frontend image: $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)"
+                echo "✓ Backend image: $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)"
+
+  # ============================================
+  # Stage 3: Security Scanning
+  # ============================================
+  - stage: SecurityScanning
+    displayName: "Security Scanning"
+    dependsOn: Build
+    jobs:
+      - job: TrivyImageScan
+        displayName: "Trivy Image Vulnerability Scan"
+        steps:
+          - task: Bash@3
+            displayName: "Scan Frontend Image"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Scanning frontend image for vulnerabilities..."
+
+                trivy image \
+                  --severity HIGH,CRITICAL \
+                  --exit-code 1 \
+                  --no-progress \
+                  $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)
+
+                # Generate HTML report
+                trivy image \
+                  --severity HIGH,CRITICAL \
+                  --format template \
+                  --template '@/usr/local/share/trivy/templates/html.tpl' \
+                  --output $(Build.ArtifactStagingDirectory)/html-reports/trivy-frontend-report.html \
+                  $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)
+
+                echo "✓ Frontend scan completed"
+
+          - task: Bash@3
+            displayName: "Scan Backend Image"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Scanning backend image for vulnerabilities..."
+
+                trivy image \
+                  --severity HIGH,CRITICAL \
+                  --exit-code 1 \
+                  --no-progress \
+                  $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)
+
+                # Generate HTML report
+                trivy image \
+                  --severity HIGH,CRITICAL \
+                  --format template \
+                  --template '@/usr/local/share/trivy/templates/html.tpl' \
+                  --output $(Build.ArtifactStagingDirectory)/html-reports/trivy-backend-report.html \
+                  $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)
+
+                echo "✓ Backend scan completed"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Trivy Reports Information"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/html-reports"
+              ArtifactName: "trivy-reports"
+
+          - task: PublishHtmlReport@1
+            displayName: "Publish HTML Security Report"
+            condition: succeededOrFailed()
+            inputs:
+              reportDir: "$(Build.ArtifactStagingDirectory)/html-reports"
+              tabName: "Security Scan Results"
+
+      - job: DependencyScan
+        displayName: "Dependency Vulnerability Scan"
+        steps:
+          - task: Bash@3
+            displayName: "Scan Python Dependencies (Backend)"
+            inputs:
+              targetType: "inline"
+              script: |
+                if [ -f backend/requirements.txt ]; then
+                  echo "Scanning Python dependencies..."
+                  trivy fs --scanners vuln backend/requirements.txt
+                fi
+
+          - task: Bash@3
+            displayName: "Scan npm Dependencies (Frontend)"
+            inputs:
+              targetType: "inline"
+              script: |
+                if [ -f frontend/package.json ]; then
+                  echo "Scanning npm dependencies..."
+                  trivy fs --scanners vuln frontend/package.json
+                fi
+
+  # ============================================
+  # Stage 4: Push to ECR
+  # ============================================
+  - stage: PushImages
+    displayName: "Push Images to ECR"
+    dependsOn: SecurityScanning
+    jobs:
+      - job: PushToECR
+        displayName: "Push to Amazon ECR"
+        steps:
+          - task: Bash@3
+            displayName: "ECR Login"
+            inputs:
+              targetType: "inline"
+              script: |
+                aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY)
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+          - task: Docker@2
+            displayName: "Push Frontend Image"
+            inputs:
+              command: "push"
+              repository: "$(ECR_REGISTRY)/$(FRONTEND_REPO)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          - task: Docker@2
+            displayName: "Push Backend Image"
+            inputs:
+              command: "push"
+              repository: "$(ECR_REGISTRY)/$(BACKEND_REPO)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          - task: Bash@3
+            displayName: "Verify Images in ECR"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Verifying images in ECR..."
+
+                aws ecr describe-images \
+                  --repository-name $(FRONTEND_REPO) \
+                  --image-ids imageTag=$(IMAGE_TAG) \
+                  --region $(AWS_REGION)
+
+                aws ecr describe-images \
+                  --repository-name $(BACKEND_REPO) \
+                  --image-ids imageTag=$(IMAGE_TAG) \
+                  --region $(AWS_REGION)
+
+                echo "✓ Images pushed successfully"
+
+  # ============================================
+  # Stage 5: Image Signing with Cosign
+  # ============================================
+  - stage: SignImages
+    displayName: "Sign Images with Cosign"
+    dependsOn: PushImages
+    jobs:
+      - job: CosignSigning
+        displayName: "Cosign Image Signing"
+        steps:
+          - task: Bash@3
+            displayName: "Setup Cosign Keys"
+            inputs:
+              targetType: "inline"
+              script: |
+                # Use cosign.key from repository
+                # echo "$(COSIGN_PRIVATE_KEY)" > /tmp/cosign.key
+                # chmod 600 /tmp/cosign.key
+
+                export COSIGN_PASSWORD=$(COSIGN_PASSWORD)
+
+                echo "✓ Cosign keys configured"
+
+          - task: Bash@3
+            displayName: "Sign Frontend Image"
+            inputs:
+              targetType: "inline"
+              script: |
+                export COSIGN_PASSWORD=$(COSIGN_PASSWORD)
+
+                cosign sign --key cosign.key \
+                  $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)
+
+                echo "✓ Frontend image signed"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+          - task: Bash@3
+            displayName: "Sign Backend Image"
+            inputs:
+              targetType: "inline"
+              script: |
+                export COSIGN_PASSWORD=$(COSIGN_PASSWORD)
+
+                cosign sign --key cosign.key \
+                  $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)
+
+                echo "✓ Backend image signed"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+          - task: Bash@3
+            displayName: "Verify Signatures"
+            inputs:
+              targetType: "inline"
+              script: |
+                # Use cosign.pub from repository
+                # echo "$(COSIGN_PUBLIC_KEY)" > /tmp/cosign.pub
+
+                # Verify frontend signature
+                cosign verify --key cosign.pub \
+                  $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)
+
+                # Verify backend signature
+                cosign verify --key cosign.pub \
+                  $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)
+
+                echo "✓ All signatures verified"
+
+                # Cleanup
+                # rm -f /tmp/cosign.key /tmp/cosign.pub
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+  # ============================================
+  # Stage 6: SBOM Generation with Syft
+  # ============================================
+  - stage: GenerateSBOM
+    displayName: "Generate SBOM"
+    dependsOn: SignImages
+    jobs:
+      - job: SyftSBOM
+        displayName: "Generate Software Bill of Materials"
+        steps:
+          - task: Bash@3
+            displayName: "Generate Frontend SBOM"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Generating SBOM for frontend..."
+
+                syft $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG) \
+                  -o spdx-json \
+                  > $(Build.ArtifactStagingDirectory)/frontend-sbom.spdx.json
+
+                syft $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG) \
+                  -o table \
+                  > $(Build.ArtifactStagingDirectory)/frontend-sbom.txt
+
+                echo "✓ Frontend SBOM generated"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+          - task: Bash@3
+            displayName: "Generate Backend SBOM"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Generating SBOM for backend..."
+
+                syft $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG) \
+                  -o spdx-json \
+                  > $(Build.ArtifactStagingDirectory)/backend-sbom.spdx.json
+
+                syft $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG) \
+                  -o table \
+                  > $(Build.ArtifactStagingDirectory)/backend-sbom.txt
+
+                echo "✓ Backend SBOM generated"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+          - task: Bash@3
+            displayName: "Sign SBOMs with Cosign"
+            inputs:
+              targetType: "inline"
+              script: |
+                export COSIGN_PASSWORD=$(COSIGN_PASSWORD)
+                # echo "$(COSIGN_PRIVATE_KEY)" > /tmp/cosign.key
+
+                # Sign frontend SBOM
+                cosign sign-blob --key cosign.key --tlog-upload=false \
+                  $(Build.ArtifactStagingDirectory)/frontend-sbom.spdx.json \
+                  > $(Build.ArtifactStagingDirectory)/frontend-sbom.spdx.json.sig
+
+                # Sign backend SBOM
+                cosign sign-blob --key cosign.key --tlog-upload=false \
+                  $(Build.ArtifactStagingDirectory)/backend-sbom.spdx.json \
+                  > $(Build.ArtifactStagingDirectory)/backend-sbom.spdx.json.sig
+
+                rm -f /tmp/cosign.key
+                echo "✓ SBOMs signed"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish SBOMs"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "sbom-artifacts"
+
+  # ============================================
+  # Stage 7: Update Helm Values (GitOps)
+  # ============================================
+  - stage: UpdateHelmValues
+    displayName: "Update Helm Values"
+    dependsOn: GenerateSBOM
+    jobs:
+      - job: UpdateValues
+        displayName: "Update values.yaml with New Tags"
+        steps:
+          - checkout: self
+            persistCredentials: true
+            clean: true
+
+          - task: Bash@3
+            displayName: "Configure Git"
+            inputs:
+              targetType: "inline"
+              script: |
+                git config --global user.email "$(GIT_EMAIL)"
+                git config --global user.name "$(GIT_USERNAME)"
+
+          - task: Bash@3
+            displayName: "Update Image Tags in values.yaml"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Updating Helm values with new image tags..."
+
+                # Update frontend tag
+                sed -i "s|tag:.*# .*CI/CD.*|tag: $(IMAGE_TAG)  # Updated by CI/CD pipeline with Git SHA|" helm/app/values.yaml
+
+                # Verify changes
+                echo "Updated values.yaml:"
+                grep -A 2 "image:" helm/app/values.yaml | grep "tag:"
+
+                echo "✓ Helm values updated"
+
+          - task: Bash@3
+            displayName: "Commit and Push Helm Changes"
+            inputs:
+              targetType: "inline"
+              script: |
+                # Check if there are changes
+                if git diff --quiet helm/app/values.yaml; then
+                  echo "No changes to commit"
+                  exit 0
+                fi
+
+                # Commit changes
+                git add helm/app/values.yaml
+                git commit -m "ci: Update image tags to $(IMAGE_TAG)
+
+                - Frontend: $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)
+                - Backend: $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)
+
+                Build: $(BUILD_ID)
+                Pipeline: $(Build.DefinitionName)"
+
+                # Push to repository
+                git push origin HEAD:master
+
+                echo "✓ Helm changes committed and pushed"
+                echo "ArgoCD will detect this change and sync the deployment"
+
+  # ============================================
+  # Stage 8: Deployment Summary
+  # ============================================
+  - stage: Summary
+    displayName: "Deployment Summary"
+    dependsOn: UpdateHelmValues
+    jobs:
+      - job: PrintSummary
+        displayName: "Print Deployment Summary"
+        steps:
+          - task: Bash@3
+            displayName: "Deployment Summary"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "============================================"
+                echo "DevSecOps Pipeline Completed Successfully"
+                echo "============================================"
+                echo ""
+                echo "📦 Images Built & Pushed:"
+                echo "  • Frontend: $(ECR_REGISTRY)/$(FRONTEND_REPO):$(IMAGE_TAG)"
+                echo "  • Backend:  $(ECR_REGISTRY)/$(BACKEND_REPO):$(IMAGE_TAG)"
+                echo ""
+                echo "🔒 Security:"
+                echo "  ✓ Trivy vulnerability scan passed"
+                echo "  ✓ Images signed with Cosign"
+                echo "  ✓ SBOMs generated and signed"
+                echo ""
+                echo "📝 GitOps:"
+                echo "  ✓ Helm values.yaml updated with new tags"
+                echo "  ✓ Changes committed to repository"
+                echo "  ✓ ArgoCD will auto-sync deployment"
+                echo ""
+                echo "🎯 Next Steps:"
+                echo "  1. ArgoCD will detect the values.yaml change"
+                echo "  2. ArgoCD will sync the new deployment"
+                echo "  3. Pods will be updated with new images"
+                echo "  4. Kyverno will verify image signatures"
+                echo ""
+                echo "View ArgoCD UI for deployment status"
+                echo "============================================"

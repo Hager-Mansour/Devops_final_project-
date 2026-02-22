@@ -1,0 +1,163 @@
+---
+# Playbook: Apply Cluster Hardening
+# Implements security best practices for the EKS cluster
+
+- name: Apply Cluster Hardening
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    # ============================================
+    # Create Namespaces with Labels
+    # ============================================
+    - name: Create application namespaces
+      kubernetes.core.k8s:
+        name: "{{ item.name }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+        definition:
+          metadata:
+            labels: "{{ item.labels }}"
+      loop: "{{ namespaces }}"
+
+    # ============================================
+    # Apply Pod Security Standards
+    # ============================================
+    - name: Apply Pod Security Standards to namespaces
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              pod-security.kubernetes.io/enforce: "{{ pod_security_standard }}"
+              pod-security.kubernetes.io/audit: "{{ pod_security_standard }}"
+              pod-security.kubernetes.io/warn: "{{ pod_security_standard }}"
+      loop: "{{ namespaces }}"
+      when: item.name != 'kube-system'
+
+    # ============================================
+    # Apply Resource Quotas
+    # ============================================
+    - name: Apply resource quotas to dev namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: resource-quota
+            namespace: dev
+          spec:
+            hard:
+              requests.cpu: "{{ resource_quotas.dev.requests_cpu }}"
+              requests.memory: "{{ resource_quotas.dev.requests_memory }}"
+              limits.cpu: "{{ resource_quotas.dev.limits_cpu }}"
+              limits.memory: "{{ resource_quotas.dev.limits_memory }}"
+
+    - name: Apply resource quotas to staging namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: resource-quota
+            namespace: staging
+          spec:
+            hard:
+              requests.cpu: "{{ resource_quotas.staging.requests_cpu }}"
+              requests.memory: "{{ resource_quotas.staging.requests_memory }}"
+              limits.cpu: "{{ resource_quotas.staging.limits_cpu }}"
+              limits.memory: "{{ resource_quotas.staging.limits_memory }}"
+
+    - name: Apply resource quotas to prod namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: resource-quota
+            namespace: prod
+          spec:
+            hard:
+              requests.cpu: "{{ resource_quotas.prod.requests_cpu }}"
+              requests.memory: "{{ resource_quotas.prod.requests_memory }}"
+              limits.cpu: "{{ resource_quotas.prod.limits_cpu }}"
+              limits.memory: "{{ resource_quotas.prod.limits_memory }}"
+
+    # ============================================
+    # Apply Network Policies
+    # ============================================
+    - name: Apply default deny all ingress network policy
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: default-deny-ingress
+            namespace: "{{ item.name }}"
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+      loop: "{{ namespaces }}"
+      when: item.name not in ['kube-system', 'argocd']
+
+    - name: Apply allow same namespace network policy
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-same-namespace
+            namespace: "{{ item.name }}"
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+            ingress:
+              - from:
+                  - podSelector: {}
+      loop: "{{ namespaces }}"
+      when: item.name not in ['kube-system', 'argocd']
+
+    # ============================================
+    # Apply RBAC Restrictions
+    # ============================================
+    - name: Create read-only role for developers
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: developer-readonly
+            namespace: "{{ item.name }}"
+          rules:
+            - apiGroups: ["", "apps", "batch"]
+              resources:
+                ["pods", "deployments", "services", "configmaps", "jobs"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["pods/log"]
+              verbs: ["get", "list"]
+      loop: "{{ namespaces }}"
+      when: item.name not in ['kube-system', 'argocd']
+
+    - name: Display hardening completion status
+      debug:
+        msg:
+          - "Cluster hardening applied successfully!"
+          - "✓ Pod Security Standards: {{ pod_security_standard }}"
+          - "✓ Resource Quotas configured for all environments"
+          - "✓ Network Policies: Default deny ingress"
+          - "✓ RBAC Roles created"

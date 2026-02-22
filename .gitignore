@@ -1,0 +1,81 @@
+# ============================================
+# Core OS / IDE Tags
+# ============================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.bak
+*.tmp
+
+# ============================================
+# Terraform
+# ============================================
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfvars.json
+tfplan
+*tfplan*
+.terraform.lock.hcl
+
+# ============================================
+# Ansible
+# ============================================
+**/ansible/**/*.retry
+**/ansible/.ansible_cache
+*.retry
+
+# ============================================
+# Python (Backend)
+# ============================================
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.pytest_cache/
+**/.venv/
+venv/
+ENV/
+env/
+**/build/
+**/dist/
+**/*.egg-info/
+
+# ============================================
+# Node.js (Frontend)
+# ============================================
+**/node_modules/
+**/npm-debug.log*
+**/yarn-error.log*
+**/build/
+**/coverage/
+**/.env.local
+**/.env.development.local
+**/.env.test.local
+**/.env.production.local
+
+# ============================================
+# Security / Keys (Critical!)
+# ============================================
+**/*.key
+**/*.pem
+**/*.pub
+**/*.pfx
+**/*.cert
+**/secrets.yaml
+# Keep specific public keys if strictly needed for repo, 
+# but generally best to manage via Azure DevOps secrets
+# !cosign.pub 
+
+# ============================================
+# Build Artifacts / Logs
+# ============================================
+**/*.log
+**/checkov-report.*
+**/tfsec-results.xml
+**/checkov_report.json
+**/terraform-outputs.json
+**/html-reports/
+**/sbom-artifacts/

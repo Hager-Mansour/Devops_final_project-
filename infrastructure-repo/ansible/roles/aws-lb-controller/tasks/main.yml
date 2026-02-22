@@ -1,0 +1,4 @@
+---
+# Placeholder: AWS LB Controller role tasks
+# These tasks are currently handled in the playbook
+# Can be refactored here for better modularity

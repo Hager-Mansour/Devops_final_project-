@@ -1,0 +1,87 @@
+# Ansible Variables for EKS Configuration
+# These variables are used across all playbooks
+
+---
+# AWS Configuration
+aws_region: "us-east-1"
+cluster_name: "{{ lookup('env', 'CLUSTER_NAME') | default('enterprise-devsecops-eks', true) }}"
+
+# Kubernetes Namespaces
+namespaces:
+  - name: argocd
+    labels:
+      purpose: gitops
+  - name: dev
+    labels:
+      environment: development
+  - name: staging
+    labels:
+      environment: staging
+  - name: prod
+    labels:
+      environment: production
+
+# Argo CD Configuration
+argocd:
+  version: "9.4.1" # Helm chart version (App v3.3.0, K8s 1.35 compatible)
+  namespace: argocd
+  service_type: LoadBalancer
+
+# AWS Load Balancer Controller
+aws_lb_controller:
+  version: "1.17.0" # Helm chart v1.17.0 → App v2.17.0 (supports K8s 1.35)
+  namespace: kube-system
+
+# Metrics Server
+metrics_server:
+  version: "3.13.0" # Helm chart version (App v0.8.0, K8s 1.35 compatible)
+  namespace: kube-system
+
+# Cluster Autoscaler
+cluster_autoscaler:
+  version: "9.55.0" # Helm chart version (App v1.35.0, matches K8s 1.35)
+  namespace: kube-system
+
+# Kyverno Policy Engine
+kyverno:
+  version: "3.6.1" # Helm chart version (App v1.16.1, K8s 1.35 compatible)
+  namespace: kyverno
+  admission_controller: true
+  background_scan: true
+  # Image verification settings
+  image_verification:
+    enabled: true
+    allowed_registries:
+      - "*.dkr.ecr.*.amazonaws.com" # AWS ECR
+      - "public.ecr.aws" # AWS Public ECR
+    require_signed_images: true # Using Cosign for image signing
+    block_latest_tag: true # Prevent using 'latest' tag
+    cosign_public_key: "{{ lookup('env', 'COSIGN_PUBLIC_KEY') | default('', true) }}" # Cosign public key
+
+# Security Configuration
+pod_security_standard: restricted
+
+# Resource Quotas (per namespace)
+resource_quotas:
+  dev:
+    requests_cpu: "4"
+    requests_memory: "8Gi"
+    limits_cpu: "8"
+    limits_memory: "16Gi"
+  staging:
+    requests_cpu: "8"
+    requests_memory: "16Gi"
+    limits_cpu: "16"
+    limits_memory: "32Gi"
+  prod:
+    requests_cpu: "16"
+    requests_memory: "32Gi"
+    limits_cpu: "32"
+    limits_memory: "64Gi"
+
+# NGINX Ingress Controller
+nginx_ingress:
+  version: "4.12.0" # Helm chart version (supports K8s 1.35)
+  namespace: ingress-nginx
+  service_type: LoadBalancer # AWS NLB via AWS LB Controller
+  replica_count: 2

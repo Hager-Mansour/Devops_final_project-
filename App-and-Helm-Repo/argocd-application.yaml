@@ -1,0 +1,67 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: microservices-app
+  namespace: argocd
+  # Finalizer ensures cascading deletion
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # Application source
+  project: default
+
+  source:
+    # Git repository containing Helm chart
+    repoURL: https://dev.azure.com/karimkhaledmohammed/Final-NTI-Project/_git/App-and-Helm-Repo
+    targetRevision: master
+    path: helm/app
+
+    # Helm configuration
+    helm:
+      # Use values.yaml from the repo
+      valueFiles:
+        - values.yaml
+
+      # Additional parameters (can override values.yaml)
+      parameters:
+        - name: global.environment
+          value: dev
+
+  # Deployment destination
+  destination:
+    # Target Kubernetes cluster
+    server: https://kubernetes.default.svc
+    namespace: dev
+
+  # Sync policy
+  syncPolicy:
+    # Automated sync configuration
+    automated:
+      # Auto-sync when Git changes detected
+      prune: true # Delete resources not in Git
+      selfHeal: true # Revert manual kubectl changes
+      allowEmpty: false # Don't sync if no resources
+
+    # Sync options
+    syncOptions:
+      - CreateNamespace=true # Create namespace if doesn't exist
+      - PrunePropagationPolicy=foreground # Delete in order
+      - PruneLast=true # Prune after final sync wave
+
+    # Retry configuration
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Health assessment
+  revisionHistoryLimit: 10
+
+  # Ignore differences (prevent infinite loops)
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas # Ignore if HPA modifies replicas

@@ -1,0 +1,63 @@
+---
+# Main Playbook: Configure EKS Cluster
+# This orchestrates all EKS cluster configuration tasks
+# Run this after Terraform has successfully created the EKS cluster
+
+- name: Configure EKS Cluster
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Display configuration info
+      debug:
+        msg:
+          - "Configuring EKS Cluster: {{ cluster_name }}"
+          - "AWS Region: {{ aws_region }}"
+
+    - name: Update kubeconfig for EKS cluster
+      shell: |
+        aws eks update-kubeconfig \
+          --name {{ cluster_name }} \
+          --region {{ aws_region }}
+      changed_when: true
+
+    - name: Verify cluster connectivity
+      kubernetes.core.k8s_cluster_info:
+      register: cluster_info
+
+    - name: Display cluster info
+      debug:
+        msg: "Connected to Kubernetes version: {{ cluster_info.version.server }}"
+
+    - name: Create required namespaces
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item }}"
+      loop:
+        - dev
+        - staging
+        - prod
+
+- name: Configuration Complete
+  hosts: local
+  gather_facts: false
+  tasks:
+    - name: Display completion message
+      debug:
+        msg:
+          - "==================================================="
+          - "EKS Cluster Configuration Complete!"
+          - "==================================================="
+          - "Next steps:"
+          - "1. Get Argo CD admin password:"
+          - "   kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+          - "2. Access Argo CD UI:"
+          - "   kubectl port-forward svc/argocd-server -n argocd 8080:443"
+          - "   Open: https://localhost:8080"
+          - "3. Configure your application repositories in Argo CD"

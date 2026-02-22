@@ -1,0 +1,40 @@
+---
+# Template: Verify Tools
+# Lightweight verification that required tools are installed
+# Does NOT install anything - assumes pre-installed on agent
+
+steps:
+  - script: |
+      echo "Verifying required tools are installed..."
+      
+      # Check Terraform
+      if ! command -v terraform &> /dev/null; then
+        echo "ERROR: Terraform not found. Please run scripts/bootstrap-agent.sh"
+        exit 1
+      fi
+      echo "✓ Terraform: $(terraform version | head -n1)"
+      
+      # Check AWS CLI
+      if ! command -v aws &> /dev/null; then
+        echo "ERROR: AWS CLI not found. Please run scripts/bootstrap-agent.sh"
+        exit 1
+      fi
+      echo "✓ AWS CLI: $(aws --version)"
+      
+      # Check Ansible
+      if ! command -v ansible &> /dev/null; then
+        echo "ERROR: Ansible not found. Please run scripts/bootstrap-agent.sh"
+        exit 1
+      fi
+      echo "✓ Ansible: $(ansible --version | head -n1)"
+      
+      # Check kubectl
+      if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl not found. Please run scripts/bootstrap-agent.sh"
+        exit 1
+      fi
+      echo "✓ kubectl: $(kubectl version --client --short 2>/dev/null | head -n1)"
+      
+      echo ""
+      echo "All required tools are installed!"
+    displayName: 'Verify Required Tools'

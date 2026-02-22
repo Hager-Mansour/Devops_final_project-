@@ -1,0 +1,481 @@
+---
+# Playbook: Install Kubernetes Addons
+# Installs essential cluster addons: Metrics Server, AWS LB Controller, Cluster Autoscaler
+
+- name: Install Kubernetes Addons
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    # ============================================
+    # Metrics Server Installation
+    # ============================================
+    - name: Add Metrics Server Helm repository
+      kubernetes.core.helm_repository:
+        name: metrics-server
+        repo_url: https://kubernetes-sigs.github.io/metrics-server/
+
+    - name: Deploy Metrics Server
+      kubernetes.core.helm:
+        name: metrics-server
+        chart_ref: metrics-server/metrics-server
+        chart_version: "{{ metrics_server.version }}"
+        release_namespace: "{{ metrics_server.namespace }}"
+        create_namespace: false
+        update_repo_cache: true
+        values:
+          args:
+            - --kubelet-preferred-address-types=InternalIP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 200Mi
+            requests:
+              cpu: 50m
+              memory: 100Mi
+
+    - name: Wait for Metrics Server to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: metrics-server
+        namespace: "{{ metrics_server.namespace }}"
+      register: metrics_deployment
+      until: metrics_deployment.resources[0].status.readyReplicas | default(0) > 0
+      retries: 20
+      delay: 10
+
+    # ============================================
+    # AWS Load Balancer Controller Installation
+    # ============================================
+    - name: Add AWS Load Balancer Controller Helm repository
+      kubernetes.core.helm_repository:
+        name: eks
+        repo_url: https://aws.github.io/eks-charts
+
+    - name: Get EKS cluster VPC ID
+      shell: |
+        aws eks describe-cluster \
+          --name {{ cluster_name }} \
+          --region {{ aws_region }} \
+          --query "cluster.resourcesVpcConfig.vpcId" \
+          --output text
+      register: vpc_id_result
+      changed_when: false
+
+    - name: Install AWS Load Balancer Controller CRDs
+      shell: |
+        kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller//crds?ref=master"
+      register: crds_result
+      changed_when: "'created' in crds_result.stdout or 'configured' in crds_result.stdout"
+      failed_when: false
+
+    - name: Deploy AWS Load Balancer Controller
+      kubernetes.core.helm:
+        name: aws-load-balancer-controller
+        chart_ref: eks/aws-load-balancer-controller
+        chart_version: "{{ aws_lb_controller.version }}"
+        release_namespace: "{{ aws_lb_controller.namespace }}"
+        create_namespace: false
+        update_repo_cache: true
+        values:
+          clusterName: "{{ cluster_name }}"
+          region: "{{ aws_region }}"
+          vpcId: "{{ vpc_id_result.stdout }}"
+          serviceAccount:
+            create: true
+            name: aws-load-balancer-controller
+            annotations:
+              eks.amazonaws.com/role-arn: "{{ lookup('env', 'LB_CONTROLLER_ROLE_ARN') }}"
+          resources:
+            limits:
+              cpu: 200m
+              memory: 500Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+
+    - name: Wait for AWS Load Balancer Controller to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: aws-load-balancer-controller
+        namespace: "{{ aws_lb_controller.namespace }}"
+      register: lb_deployment
+      until: lb_deployment.resources[0].status.readyReplicas | default(0) > 0
+      retries: 20
+      delay: 10
+
+    # ============================================
+    # NGINX Ingress Controller Installation
+    # ============================================
+    - name: Create ingress-nginx namespace
+      kubernetes.core.k8s:
+        name: "{{ nginx_ingress.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add NGINX Ingress Helm repository
+      kubernetes.core.helm_repository:
+        name: ingress-nginx
+        repo_url: https://kubernetes.github.io/ingress-nginx
+
+    - name: Deploy NGINX Ingress Controller
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: ingress-nginx/ingress-nginx
+        chart_version: "{{ nginx_ingress.version }}"
+        release_namespace: "{{ nginx_ingress.namespace }}"
+        create_namespace: false
+        update_repo_cache: true
+        values:
+          controller:
+            replicaCount: "{{ nginx_ingress.replica_count }}"
+            service:
+              type: "{{ nginx_ingress.service_type }}"
+              annotations:
+                # Use AWS Network Load Balancer
+                service.beta.kubernetes.io/aws-load-balancer-type: external
+                service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            # Pod Security Context for PSS restricted
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 101
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                  - ALL
+                add:
+                  - NET_BIND_SERVICE
+              seccompProfile:
+                type: RuntimeDefault
+            admissionWebhooks:
+              enabled: true
+          # Default backend
+          defaultBackend:
+            enabled: false
+
+    - name: Wait for NGINX Ingress Controller to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: ingress-nginx-controller
+        namespace: "{{ nginx_ingress.namespace }}"
+      register: nginx_deployment
+      until: nginx_deployment.resources[0].status.readyReplicas | default(0) > 0
+      retries: 20
+      delay: 10
+
+    # ============================================
+    # ============================================
+    # Cluster Autoscaler Installation (DISABLED)
+    # ============================================
+    # Cluster Autoscaler disabled - using manual node scaling (10 nodes)
+    # Uncomment below if auto-scaling is needed and OIDC is properly configured
+
+    # - name: Add Cluster Autoscaler Helm repository
+    #   kubernetes.core.helm_repository:
+    #     name: autoscaler
+    #     repo_url: https://kubernetes.github.io/autoscaler
+
+    # - name: Deploy Cluster Autoscaler
+    #   kubernetes.core.helm:
+    #     name: cluster-autoscaler
+    #     chart_ref: autoscaler/cluster-autoscaler
+    #     chart_version: "{{ cluster_autoscaler.version }}"
+    #     release_namespace: "{{ cluster_autoscaler.namespace }}"
+    #     create_namespace: false
+    #     update_repo_cache: true
+    #     values:
+    #       autoDiscovery:
+    #         clusterName: "{{ cluster_name }}"
+    #       awsRegion: "{{ aws_region }}"
+    #       rbac:
+    #         create: true
+    #         serviceAccount:
+    #           annotations:
+    #             eks.amazonaws.com/role-arn: "{{ lookup('env', 'CLUSTER_AUTOSCALER_ROLE_ARN') }}"
+    #       resources:
+    #         limits:
+    #           cpu: 100m
+    #           memory: 300Mi
+    #         requests:
+    #           cpu: 50m
+    #           memory: 100Mi
+    #   when: lookup('env', 'CLUSTER_AUTOSCALER_ROLE_ARN') | default('', true) != ''
+
+    # ============================================
+    # Kyverno Policy Engine Installation
+    # ============================================
+    - name: Create Kyverno namespace
+      kubernetes.core.k8s:
+        name: "{{ kyverno.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Kyverno Helm repository
+      kubernetes.core.helm_repository:
+        name: kyverno
+        repo_url: https://kyverno.github.io/kyverno/
+
+    - name: Deploy Kyverno
+      kubernetes.core.helm:
+        name: kyverno
+        chart_ref: kyverno/kyverno
+        chart_version: "{{ kyverno.version }}"
+        release_namespace: "{{ kyverno.namespace }}"
+        create_namespace: false
+        update_repo_cache: true
+        values:
+          admissionController:
+            replicas: 1 # Kyverno only supports 1 (standalone) or 3 (HA)
+            resources:
+              limits:
+                cpu: 400m
+                memory: 512Mi
+              requests:
+                cpu: 200m
+                memory: 256Mi
+          backgroundController:
+            enabled: "{{ kyverno.background_scan }}"
+            resources:
+              limits:
+                cpu: 200m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          cleanupController:
+            enabled: true
+            resources:
+              limits:
+                cpu: 100m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+          reportsController:
+            enabled: true
+            resources:
+              limits:
+                cpu: 200m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+
+    - name: Wait for Kyverno to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: kyverno-admission-controller
+        namespace: "{{ kyverno.namespace }}"
+      register: kyverno_deployment
+      until: kyverno_deployment.resources[0].status.readyReplicas | default(0) >= 1
+      retries: 20
+      delay: 10
+      failed_when: false # Don't fail if Kyverno takes longer to start
+
+    # ============================================
+    # Apply Kyverno Policies
+    # ============================================
+    - name: Apply Kyverno policy to block 'latest' tag
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
+          metadata:
+            name: disallow-latest-tag
+            annotations:
+              policies.kyverno.io/title: Disallow Latest Tag
+              policies.kyverno.io/category: Best Practices
+              policies.kyverno.io/severity: medium
+              policies.kyverno.io/description: >-
+                The ':latest' tag is mutable and can lead to unexpected image updates.
+                Require explicit image tags for better version control and security.
+          spec:
+            validationFailureAction: Enforce
+            background: true
+            rules:
+              - name: require-image-tag
+                match:
+                  any:
+                    - resources:
+                        kinds:
+                          - Pod
+                        namespaces:
+                          - dev
+                          - staging
+                          - prod
+                validate:
+                  message: "Image tag ':latest' is not allowed. Use explicit version tags."
+                  pattern:
+                    spec:
+                      containers:
+                        - image: "!*:latest"
+              - name: require-initcontainer-tag
+                match:
+                  any:
+                    - resources:
+                        kinds:
+                          - Pod
+                        namespaces:
+                          - dev
+                          - staging
+                          - prod
+                validate:
+                  message: "Init container image tag ':latest' is not allowed."
+                  pattern:
+                    spec:
+                      =(initContainers):
+                        - image: "!*:latest"
+      when: kyverno.image_verification.block_latest_tag
+
+    - name: Apply Kyverno policy to require resource limits
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
+          metadata:
+            name: require-resource-limits
+            annotations:
+              policies.kyverno.io/title: Require Resource Limits
+              policies.kyverno.io/category: Resource Management
+              policies.kyverno.io/severity: medium
+              policies.kyverno.io/description: >-
+                Requires all containers to have CPU and memory limits defined.
+                This prevents resource exhaustion and improves cluster stability.
+          spec:
+            validationFailureAction: Enforce
+            background: true
+            rules:
+              - name: check-container-resources
+                match:
+                  any:
+                    - resources:
+                        kinds:
+                          - Pod
+                        namespaces:
+                          - dev
+                          - staging
+                          - prod
+                validate:
+                  message: "All containers must have CPU and memory requests and limits defined"
+                  pattern:
+                    spec:
+                      containers:
+                        - resources:
+                            requests:
+                              memory: "?*"
+                              cpu: "?*"
+                            limits:
+                              memory: "?*"
+                              cpu: "?*"
+
+    - name: Apply Kyverno policy to ensure ECR images only
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
+          metadata:
+            name: restrict-image-registries
+            annotations:
+              policies.kyverno.io/title: Restrict Image Registries
+              policies.kyverno.io/category: Security
+              policies.kyverno.io/severity: high
+              policies.kyverno.io/description: >-
+                Ensures that container images come from approved AWS ECR registries only.
+                This prevents running images from untrusted or public sources.
+          spec:
+            validationFailureAction: Enforce
+            background: true
+            rules:
+              - name: validate-registries
+                match:
+                  any:
+                    - resources:
+                        kinds:
+                          - Pod
+                        namespaces:
+                          - dev
+                          - staging
+                          - prod
+                validate:
+                  message: >-
+                    Images must come from approved ECR registries.
+                    Allowed: *.dkr.ecr.*.amazonaws.com, public.ecr.aws
+                  pattern:
+                    spec:
+                      containers:
+                        - image: "*.dkr.ecr.*.amazonaws.com/* | public.ecr.aws/*"
+      when: kyverno.image_verification.enabled
+
+    - name: Apply Kyverno policy to verify image signatures with Cosign
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
+          metadata:
+            name: verify-image-signatures
+            annotations:
+              policies.kyverno.io/title: Verify Image Signatures
+              policies.kyverno.io/category: Security
+              policies.kyverno.io/severity: high
+              policies.kyverno.io/description: >-
+                Verifies that container images are signed using Cosign before allowing deployment.
+                This ensures image integrity and authenticity in the supply chain.
+          spec:
+            validationFailureAction: Enforce
+            background: false
+            webhookTimeoutSeconds: 30
+            rules:
+              - name: verify-signature
+                match:
+                  any:
+                    - resources:
+                        kinds:
+                          - Pod
+                        namespaces:
+                          - dev
+                          - staging
+                          - prod
+                verifyImages:
+                  - imageReferences:
+                      - "*.dkr.ecr.*.amazonaws.com/*"
+                      - "public.ecr.aws/*"
+                    attestors:
+                      - count: 1
+                        entries:
+                          - keys:
+                              publicKeys: |-
+                                {{ kyverno.image_verification.cosign_public_key }}
+      when: kyverno.image_verification.require_signed_images and kyverno.image_verification.cosign_public_key != ''
+
+    - name: Display addons installation status
+      debug:
+        msg:
+          - "Kubernetes addons installed successfully!"
+          - "✓ Metrics Server"
+          - "✓ AWS Load Balancer Controller"
+          - "✓ NGINX Ingress Controller"
+          - "✓ Kyverno Policy Engine"
+          - ""
+          - "Note: Cluster Autoscaler disabled - using manual scaling (15 nodes)"
+          - ""
+          - "Kyverno Policies Applied:"
+          - "  • Block ':latest' tag (enforced)"
+          - "  • Require resource limits (enforced)"
+          - "  • Require signed images (if configured)"
+          - "  • Verify image signatures with Cosign (enforced)"

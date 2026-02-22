@@ -1,0 +1,105 @@
+---
+# Playbook: Install Argo CD for GitOps
+# Deploys Argo CD using Helm chart
+
+- name: Install Argo CD
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Create Argo CD namespace
+      kubernetes.core.k8s:
+        name: "{{ argocd.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Argo CD Helm repository
+      kubernetes.core.helm_repository:
+        name: argo
+        repo_url: https://argoproj.github.io/argo-helm
+
+    - name: Deploy Argo CD using Helm
+      kubernetes.core.helm:
+        name: argocd
+        chart_ref: argo/argo-cd
+        chart_version: "{{ argocd.version }}"
+        release_namespace: "{{ argocd.namespace }}"
+        create_namespace: false
+        update_repo_cache: true
+        atomic: false # Don't rollback on failure
+        wait: false # Don't wait for all resources
+        wait_timeout: 10m
+        values:
+          global:
+            domain: argocd.local
+
+          server:
+            service:
+              type: "{{ argocd.service_type }}"
+            extraArgs:
+              - --insecure # For non-production environments
+
+          configs:
+            params:
+              server.insecure: true
+
+          # Enable notifications controller
+          notifications:
+            enabled: true
+
+          # Enable ApplicationSet controller
+          applicationSet:
+            enabled: true
+
+          # Resource limits
+          controller:
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 250m
+                memory: 256Mi
+
+          repoServer:
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 250m
+                memory: 256Mi
+
+          redis:
+            resources:
+              limits:
+                cpu: 200m
+                memory: 128Mi
+              requests:
+                cpu: 100m
+                memory: 64Mi
+
+    - name: Wait for Argo CD pods to be ready
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ argocd.namespace }}"
+        label_selectors:
+          - app.kubernetes.io/part-of=argocd
+      register: argocd_pods
+      until: argocd_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length >= 3
+      retries: 30
+      delay: 10
+      failed_when: false # Don't fail if nodes are at capacity
+
+    - name: Display ArgoCD installation status
+      debug:
+        msg:
+          - "Argo CD installed successfully!"
+          - "Namespace: {{ argocd.namespace }}"
+          - "Service Type: {{ argocd.service_type }}"
+          - ""
+          - "To get the admin password, run:"
+          - "kubectl -n {{ argocd.namespace }} get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"

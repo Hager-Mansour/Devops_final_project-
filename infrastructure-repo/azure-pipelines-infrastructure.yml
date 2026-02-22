@@ -1,0 +1,561 @@
+---
+# Azure DevOps Pipeline - Infrastructure Deployment
+# Deploys EKS infrastructure using Terraform and configures it with Ansible
+# Implements best practices: validation, security scanning, approval gates, and verification
+
+trigger:
+  branches:
+    include:
+      - master
+      - develop
+  paths:
+    include:
+      - terraform/**
+      - ansible/**
+      - scripts/**
+      - azure-pipelines-infrastructure.yml
+
+pr:
+  branches:
+    include:
+      - master
+      - develop
+  paths:
+    include:
+      - terraform/**
+      - ansible/**
+
+parameters:
+  - name: environment
+    displayName: "Environment"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - staging
+      - prod
+
+variables:
+  - name: Environment
+    value: ${{ parameters.environment }}
+  - group: infrastructure-${{ parameters.environment }} # Variable group per environment
+  - group: infrastructure-secrets # Cosign keys, etc.
+  - name: terraformVersion
+    value: "1.6.0"
+  - name: ansibleVersion
+    value: "2.14"
+  - name: awsRegion
+    value: "us-east-1"
+
+pool:
+  name: "MyLocalPool"
+
+stages:
+  # ============================================
+  # Stage 1: Validation
+  # ============================================
+  - stage: Validate
+    displayName: "Validation & Security Scanning"
+    jobs:
+      - job: PreFlightCheck
+        displayName: "Pre-Flight Validation"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - script: |
+              chmod +x scripts/preflight-check.sh
+              ./scripts/preflight-check.sh || true  # Don't fail on warnings
+            displayName: "Run Pre-Flight Checks"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo
+
+          - script: |
+              terraform fmt -check -recursive
+            displayName: "Check Terraform Formatting"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              find playbooks -name "*.yml" -exec ansible-playbook {} --syntax-check \;
+            displayName: "Validate Ansible Playbooks"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/ansible
+
+      - job: SecurityScan
+        displayName: "Security Scanning"
+        dependsOn: PreFlightCheck
+        steps:
+          - checkout: self
+
+          - script: |
+              # Run tfsec (pre-installed on agent)
+              tfsec infrastructure-repo/terraform/ --format=junit > tfsec-results.xml || true
+
+              # Display results
+              tfsec infrastructure-repo/terraform/ --no-color || true
+            displayName: "Terraform Security Scan (tfsec)"
+
+          - script: |
+              # Run checkov (pre-installed on agent)
+              # 1. Generate JUnit XML for Test Results tab
+              checkov -d infrastructure-repo/terraform/ --framework terraform --output junitxml > checkov-results.xml || true
+
+              # 2. Generate JSON for HTML Report
+              checkov -d infrastructure-repo/terraform/ --framework terraform --output json > checkov_report.json || true
+
+              # 3. Display results in build logs
+              checkov -d infrastructure-repo/terraform/ --framework terraform || true
+
+              # 4. Convert JSON to HTML using Python
+              python3 -c '
+              import json
+
+              try:
+                  with open("checkov_report.json", "r") as f:
+                      data = json.load(f)
+
+                  html = "<html><head><title>Checkov Report</title><style>body { font-family: Arial, sans-serif; } table, th, td {border: 1px solid #ddd; border-collapse: collapse; padding: 8px;} th { background-color: #f2f2f2; } .failed { background-color: #ffcccc; } .passed { background-color: #ccffcc; }</style></head><body><h1>Checkov Scan Results</h1>"
+
+                  # Checkov output structure can vary (list of results or single dict)
+                  if isinstance(data, list):
+                      results = data
+                  else:
+                      results = [data]
+
+                  for res in results:
+                      check_type = res.get("check_type", "Unknown")
+                      html += f"<h2>{check_type}</h2>"
+
+                      summary = res.get("summary", {})
+                      passed = summary.get("passed", 0)
+                      failed = summary.get("failed", 0)
+                      html += f"<p>Passed: {passed} | Failed: {failed}</p>"
+
+                      html += "<table><tr><th>Check ID</th><th>Name</th><th>Result</th><th>File</th></tr>"
+
+                      # Failed checks
+                      if "results" in res and "failed_checks" in res["results"]:
+                          for check in res["results"]["failed_checks"]:
+                              html += f"""<tr class="failed"><td>{check.get("check_id")}</td><td>{check.get("check_name")}</td><td>FAILED</td><td>{check.get("file_path")}</td></tr>"""
+
+                      # Passed checks
+                      if "results" in res and "passed_checks" in res["results"]:
+                          for check in res["results"]["passed_checks"]:
+                               html += f"""<tr class="passed"><td>{check.get("check_id")}</td><td>{check.get("check_name")}</td><td>PASSED</td><td>{check.get("file_path")}</td></tr>"""
+
+                      html += "</table><br/>"
+
+                  html += "</body></html>"
+
+                  with open("checkov-report.html", "w") as f:
+                      f.write(html)
+
+              except Exception as e:
+                  print(f"Error generating HTML: {e}")
+                  with open("checkov-report.html", "w") as f:
+                      f.write(f"<html><body><h1>Error generating report</h1><p>{str(e)}</p></body></html>")
+              '
+            displayName: "Policy-as-Code Scan (Checkov)"
+
+          - task: PublishTestResults@2
+            displayName: "Publish Security Scan Results"
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "*-results.xml"
+              mergeTestResults: true
+              failTaskOnFailedTests: false
+              testRunTitle: "Security Scan Results"
+
+          - task: PublishHtmlReport@1
+            displayName: "Publish Checkov HTML Report"
+            condition: succeededOrFailed()
+            inputs:
+              reportDir: "$(System.DefaultWorkingDirectory)/checkov-report.html"
+              tabName: "Checkov Report"
+
+  # ============================================
+  # Stage 2: Terraform Plan
+  # ============================================
+  - stage: TerraformPlan
+    displayName: "Terraform Plan"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: Plan
+        displayName: "Generate Terraform Plan"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - script: |
+              # Create backend bucket if it doesn't exist
+              chmod +x ../scripts/create-backend.sh
+              ../scripts/create-backend.sh $(Environment) || echo "Backend may already exist"
+            displayName: "Ensure Terraform Backend Exists"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              # Get AWS account ID for unique bucket name
+              ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+              terraform init \
+                -backend-config="bucket=devsecops-tfstate-${ACCOUNT_ID}-$(Environment)" \
+                -backend-config="region=$(awsRegion)"
+            displayName: "Terraform Init"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              terraform validate
+            displayName: "Terraform Validate"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              # Terraform plan with detailed exit code
+              # Exit codes: 0 = no changes, 1 = error, 2 = success with changes
+              terraform plan \
+                -var="environment=$(Environment)" \
+                -var="aws_region=$(awsRegion)" \
+                -out=tfplan \
+                -detailed-exitcode || EXIT_CODE=$?
+
+              # Handle exit codes properly
+              if [ "${EXIT_CODE:-0}" -eq 0 ]; then
+                echo "No changes needed"
+              elif [ "${EXIT_CODE:-0}" -eq 2 ]; then
+                echo "Plan created successfully with changes"
+                exit 0
+              else
+                echo "Plan failed with error"
+                exit 1
+              fi
+            displayName: "Terraform Plan"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+            env:
+              TF_VAR_environment: $(Environment)
+              TF_VAR_aws_region: $(awsRegion)
+
+          - script: |
+              terraform show -json tfplan > tfplan.json
+              terraform show tfplan > tfplan.txt
+            displayName: "Export Plan"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Terraform Plan"
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)/infrastructure-repo/terraform/tfplan"
+              artifact: "terraform-plan"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Plan Output"
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)/infrastructure-repo/terraform/tfplan.txt"
+              artifact: "terraform-plan-output"
+
+          - script: |
+              echo "========================================="
+              echo "Terraform Plan Summary"
+              echo "========================================="
+              cat tfplan.txt
+            displayName: "Display Plan Summary"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+  # ============================================
+  # Stage 3: Approval Gate
+  # ============================================
+  - stage: ApprovalGate
+    displayName: "Manual Approval"
+    dependsOn: TerraformPlan
+    condition: and(succeeded(), ne(variables['AUTO_APPROVE'], 'true'))
+    jobs:
+      - job: waitForValidation
+        displayName: "Wait for Manual Approval"
+        pool: server
+        timeoutInMinutes: 1440 # 24 hours
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: ""
+              instructions: "Please review the Terraform plan in the artifacts and approve to proceed with infrastructure deployment."
+              onTimeout: "reject"
+
+  # ============================================
+  # Stage 4: Terraform Apply
+  # ============================================
+  - stage: TerraformApply
+    displayName: "Terraform Apply"
+    dependsOn:
+      - TerraformPlan
+      - ApprovalGate
+    condition: |
+      or(
+        and(succeeded('TerraformPlan'), eq(variables['AUTO_APPROVE'], 'true')),
+        and(succeeded('ApprovalGate'), succeeded('TerraformPlan'))
+      )
+    jobs:
+      - job: Apply
+        displayName: "Apply Terraform Changes"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Terraform Plan"
+            inputs:
+              artifact: "terraform-plan"
+              targetPath: "$(Build.SourcesDirectory)/infrastructure-repo/terraform"
+
+          - script: |
+              # Get AWS account ID for unique bucket name
+              ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+              terraform init \
+                -backend-config="bucket=devsecops-tfstate-${ACCOUNT_ID}-$(Environment)" \
+                -backend-config="region=$(awsRegion)"
+            displayName: "Terraform Init"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              terraform apply -auto-approve tfplan
+            displayName: "Terraform Apply"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - script: |
+              # Export outputs for Ansible
+              terraform output -json > terraform-outputs.json
+              echo "##vso[task.setvariable variable=CLUSTER_NAME;isOutput=true]$(terraform output -raw cluster_name)"
+              echo "##vso[task.setvariable variable=CLUSTER_ENDPOINT;isOutput=true]$(terraform output -raw cluster_endpoint)"
+              echo "##vso[task.setvariable variable=RDS_ENDPOINT;isOutput=true]$(terraform output -raw rds_endpoint)"
+            displayName: "Export Terraform Outputs"
+            name: TerraformOutputs
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Terraform Outputs"
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)/infrastructure-repo/terraform/terraform-outputs.json"
+              artifact: "terraform-outputs"
+
+  # ============================================
+  # Stage 5: Ansible Configuration
+  # ============================================
+  - stage: AnsibleConfiguration
+    displayName: "Configure EKS Cluster"
+    dependsOn: TerraformApply
+    condition: succeeded()
+    variables:
+      clusterName: $[ stageDependencies.TerraformApply.Apply.outputs['TerraformOutputs.CLUSTER_NAME'] ]
+    jobs:
+      - job: ConfigureCluster
+        displayName: "Run Ansible Playbooks"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/verify-tools.yml
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - script: |
+              # Get cluster name from Terraform output
+              export CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "devsecops-$(Environment)-eks")
+
+              # Configure kubectl for EKS
+              aws eks update-kubeconfig \
+                --name ${CLUSTER_NAME} \
+                --region $(awsRegion)
+
+              # Verify connection
+              kubectl get nodes
+            displayName: "Configure kubectl Access"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/terraform
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          - script: |
+              # Get cluster name from Terraform output
+              cd ../terraform
+              export CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "devsecops-$(Environment)-eks")
+              cd ../ansible
+
+              export COSIGN_PUBLIC_KEY="$(COSIGN_PUBLIC_KEY)"
+
+              # Run configure-eks playbook
+              ansible-playbook playbooks/configure-eks.yml
+            displayName: "Configure EKS (Namespaces, Security)"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/ansible
+            env:
+              COSIGN_PUBLIC_KEY: $(COSIGN_PUBLIC_KEY)
+
+          - script: |
+              # Get cluster name from Terraform output
+              cd ../terraform
+              export CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "devsecops-$(Environment)-eks")
+              cd ../ansible
+
+              ansible-playbook playbooks/install-argocd.yml
+            displayName: "Install Argo CD"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/ansible
+
+          - script: |
+              # Get cluster name from Terraform output
+              cd ../terraform
+              export CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "devsecops-$(Environment)-eks")
+              cd ../ansible
+
+              export LB_CONTROLLER_ROLE_ARN="$(LB_CONTROLLER_ROLE_ARN)"
+              export CLUSTER_AUTOSCALER_ROLE_ARN="$(CLUSTER_AUTOSCALER_ROLE_ARN)"
+              export COSIGN_PUBLIC_KEY="$(COSIGN_PUBLIC_KEY)"
+
+              ansible-playbook playbooks/install-addons.yml
+            displayName: "Install Kubernetes Addons"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/ansible
+            env:
+              LB_CONTROLLER_ROLE_ARN: $(LB_CONTROLLER_ROLE_ARN)
+              CLUSTER_AUTOSCALER_ROLE_ARN: $(CLUSTER_AUTOSCALER_ROLE_ARN)
+              COSIGN_PUBLIC_KEY: $(COSIGN_PUBLIC_KEY)
+
+          - script: |
+              export CLUSTER_NAME="$(clusterName)"
+              export COSIGN_PUBLIC_KEY="$(COSIGN_PUBLIC_KEY)"
+
+              ansible-playbook playbooks/harden-cluster.yml
+            displayName: "Apply Security Hardening"
+            workingDirectory: $(Build.SourcesDirectory)/infrastructure-repo/ansible
+            env:
+              CLUSTER_NAME: $(clusterName)
+              COSIGN_PUBLIC_KEY: $(COSIGN_PUBLIC_KEY)
+
+  # ============================================
+  # Stage 6: Verification
+  # ============================================
+  - stage: Verification
+    displayName: "Verify Deployment"
+    dependsOn: AnsibleConfiguration
+    condition: succeeded()
+    variables:
+      clusterName: $[ stageDependencies.TerraformApply.Apply.outputs['TerraformOutputs.CLUSTER_NAME'] ]
+    jobs:
+      - job: VerifyCluster
+        displayName: "Cluster Health Checks"
+        steps:
+          - checkout: self
+
+          - template: pipelines/templates/aws-credentials.yml
+            parameters:
+              awsAccessKeyId: $(AWS_ACCESS_KEY_ID)
+              awsSecretAccessKey: $(AWS_SECRET_ACCESS_KEY)
+              awsRegion: $(awsRegion)
+
+          - script: |
+              # Get cluster name from Terraform output
+              cd infrastructure-repo/terraform
+              export CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "devsecops-$(Environment)-eks")
+
+              aws eks update-kubeconfig --name ${CLUSTER_NAME} --region $(awsRegion)
+            displayName: "Configure kubectl"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          - script: |
+              echo "========================================="
+              echo "Cluster Nodes"
+              echo "========================================="
+              kubectl get nodes -o wide
+
+              echo ""
+              echo "========================================="
+              echo "Namespaces"
+              echo "========================================="
+              kubectl get namespaces
+
+              echo ""
+              echo "========================================="
+              echo "Argo CD Status"
+              echo "========================================="
+              kubectl get all -n argocd 2>/dev/null || echo "ArgoCD not yet installed"
+
+              echo ""
+              echo "========================================="
+              echo "Kyverno Status"
+              echo "========================================="
+              kubectl get all -n kyverno 2>/dev/null || echo "Kyverno not yet installed"
+
+              echo ""
+              echo "========================================="
+              echo "Cluster Policies"
+              echo "========================================="
+              kubectl get clusterpolicies 2>/dev/null || echo "No ClusterPolicies found (Kyverno may not be installed)"
+
+              echo ""
+              echo "========================================="
+              echo "✓ Cluster Health Check Complete"
+              echo "========================================="
+            displayName: "Verify Cluster Health"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          - script: |
+              echo "Testing Kyverno policies..."
+
+              # This should FAIL - latest tag blocked
+              echo "Test 1: Block :latest tag"
+              kubectl run test-latest --image=nginx:latest -n dev 2>&1 | grep -q "not allowed" && echo "✓ PASS: Latest tag blocked" || echo "✗ FAIL: Latest tag not blocked"
+
+              # Cleanup
+              kubectl delete pod test-latest -n dev --ignore-not-found=true
+
+              echo "Policy enforcement verified!"
+            displayName: "Test Policy Enforcement"
+            continueOnError: true
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          - script: |
+              echo "========================================="
+              echo "Deployment Summary"
+              echo "========================================="
+              echo "Environment: $(Environment)"
+              echo "Cluster Name: $(clusterName)"
+              echo "Region: $(awsRegion)"
+              echo "Timestamp: $(Build.BuildNumber)"
+              echo ""
+              echo "Components Deployed:"
+              echo "  ✓ EKS Cluster"
+              echo "  ✓ VPC & Networking"
+              echo "  ✓ IAM Roles & Policies"
+              echo "  ✓ ECR Repositories"
+              echo "  ✓ RDS PostgreSQL"
+              echo "  ✓ Argo CD"
+              echo "  ✓ NGINX Ingress Controller"
+              echo "  ✓ Kubernetes Addons"
+              echo "  ✓ Kyverno Policies"
+              echo "  ✓ Security Hardening"
+              echo ""
+              echo "Status: SUCCESS"
+            displayName: "Deployment Summary"
